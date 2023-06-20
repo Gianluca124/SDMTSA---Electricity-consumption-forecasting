@@ -1,0 +1,231 @@
+---
+title: "Setup&DataExploration"
+output: html_document
+date: "2023-04-21"
+---
+
+# 0) Import
+
+```{r, include=FALSE}
+set.seed(18042023)
+
+# Set time zone
+Sys.setenv(TZ='GMT')
+
+# Import packages
+packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn", "MASS", 
+              "tidyr", "ggplot2", "lubridate", "randomForest", "ranger", 
+              "tibble", "tseries")
+
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+invisible(lapply(packages, library, character.only = TRUE))
+
+################################################################################
+
+boxcoxtransform <- function(data, lambda) {
+  data_bc <- (data^lambda - 1) / lambda
+  return(data_bc)
+}
+
+boxcoxinverse <- function(data_bc, lambda) {
+  data <- (data_bc*lambda+1)^(1/lambda)
+  return(data)
+}
+```
+
+```{r}
+# Data loading
+
+# Set working directory
+working_dir = dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(working_dir)
+
+data <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
+data_xts <- xts(data$y, as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT")) # Set date format
+```
+
+# 1) Data Exploration
+
+```{r}
+summary(data_xts)
+```
+
+```{r}
+periodicity(data_xts)
+```
+
+# The time series is referred to electric energy consumption. It is univariate, and has 10 minutes periodicity. The time
+# series begins at 2017-01-01 00:00:00 and ends at 2017-11-30 23:50:00. The values for the power variable are in range
+# [13896, 52204].
+
+# Being an electricity consumption time series, it has several differen periods: the daily period, due to the day-night
+# cycle; the weekly period, due to weekends; the yearly period, due to the seasonal cycle. 
+# Specifically, since we have observations every 10 minutes, the daily cycle is composed of 144 observations (6 per hour)
+# and the weekly cycle is composed of 1008 observations (144 per day). We cannot clearly see the seasonal cycle since we
+# have just one year of observations.
+
+# Below, I show the original time series, along with the time series with daily, weekly and monthly mean:
+
+```{r}
+plot(data_xts)
+plot(apply.daily(data_xts,FUN=mean))
+plot(apply.weekly(data_xts,FUN=mean))
+plot(apply.monthly(data_xts,FUN=mean))
+```
+
+# We can already see that we have an higher energy consumption during the summer (i.e. air conditioning). Let's show the 
+# detail of a single day and a single week:
+
+```{r}
+plot(data_xts[1:144])
+plot(data_xts[144:(144*8)])
+```
+
+# We can clearly see the daily cycle, with low energy consumption during the night and a peak during the evening, when 
+# the majority of people are at home. In the weekly cycle, instead, we can see that the consumption tends to decrease
+# during the weekend.
+
+# To have an idea of each of these periodic components, let's consider the Multi-Seasonal time series object, that is
+# intended to handle time series with multiple seasonal periods:
+
+```{r}
+msts_cons <- data_xts[1:(144*60)] |> msts(seasonal.periods = c(144, 144*7))
+p <- msts_cons |> mstl() |> autoplot()
+p
+ggsave('plots/ts_decomposition.jpg', p, height = 6 , width = 11)
+```
+
+# If we look at the remainder we can se some peaks (especially negative ones). Those peaks corresponds to outliers of the
+# time series. Due to the nature of the time series, those outliers are probably due to blackouts, or some other "big"
+# events.
+
+# Let's try to detect some outliers. Since it is unusual to have drastic changes in energy consumption within a 10 
+# minutes time period, I consider the difference between two consecutive observations:
+
+```{r}
+plot(diff(data_xts,1))
+data_xts[diff(data_xts,1) < -7500 | diff(data_xts,1) > 7500] #|> index() |> as.Date()
+```
+
+```{r}
+p1 <- autoplot(data_xts["2017-01-14"]) + xlab('Hour') + ylab('Power') + scale_x_datetime(date_labels =  "%H %M")
+p1
+p2 <- autoplot(data_xts["2017-04-20"]) + xlab('Hour') + ylab('Power') + scale_x_datetime(date_labels =  "%H %M")
+p2
+p3 <- autoplot(data_xts["2017-08-30"]) + xlab('Hour') + ylab('Power') + scale_x_datetime(date_labels =  "%H %M")
+p3
+ggsave('plots/anomaly1.jpg', p1, height = 3 , width = 5)
+ggsave('plots/anomaly2.jpg', p2, height = 3 , width = 5)
+ggsave('plots/anomaly3.jpg', p3, height = 3 , width = 5)
+```
+
+# We can see some of these drastic changes (especially the one on 2017-04-20) that causes the outliers. Later, we can
+# consider to model those outliers with some ad-hoc regressors.
+
+# 2) Train/validation split
+
+# First of all, I add the 30 days to forecast (december 2017):
+
+```{r}
+tseq <- seq(from = index(data_xts[nrow(data_xts),])+600, length.out = 144*30, by = 600)
+data_xts_complete <- c(data_xts, xts(rep(as.numeric(NA), length(tseq)), tseq))
+cat(paste0("from: ", index(data_xts_complete[1]), "\nto:   ", index(data_xts_complete[nrow(data_xts_complete)])))
+```
+
+```{r}
+npred <- 30 # Number of days to forecast
+small_date <- "2017-09-01 00:00:00" # For a faster training I consider just September and October
+small_index <- which(index(data_xts_complete) == small_date)
+# I take november 2017 as the validation set
+val_date <- "2017-11-01 00:00:00"
+val_index <- which(index(data_xts_complete) == val_date)
+test_date <- "2017-12-01 00:00:00"
+test_index <- which(index(data_xts_complete) == test_date)
+cat(paste0("small_index: ", small_index,"\nval_index:   ", val_index, "\ntest_index:  ", test_index))
+```
+
+```{r}
+train <- data_xts_complete[1:(val_index-1)]
+small <- data_xts_complete[small_index:(val_index-1)]
+val <- data_xts_complete[val_index:(val_index+144*npred-1),]
+test <- data_xts_complete[test_index:nrow(data_xts_complete)]
+cat(paste0("small: ", nrow(small), "\ntrain: ", nrow(train), "\nval:   ", nrow(val), "\ntest:  ", nrow(test)))
+```
+
+# 3) Stationarity
+
+# ARIMA models requires the time series to be stationary. As we showed above, the time series is non stationary due to
+# the presence of (multiple) seasonalities and trend. 
+
+# First of all, I deal with non stationarity in variance. I check the dependency between variance and mean:
+
+```{r}
+# I took the mean and standard deviation for each day
+med <- tapply(data_xts, rep(1:334, each = 144), mean)
+sds <- tapply(data_xts, rep(1:334, each = 144), sd)
+plot(med, sds) # 334 dots -> one for each day
+abline(lm(sds~med), col='red')
+```
+
+# It seems to be a slight dependency. I could work with the logarithm, but I choose to use the most general method, the
+# Box-Cox transformation:
+
+```{r}
+bc <- boxcox(sds ~ med)
+lambda <- bc$x[which.max(bc$y)]
+lambda
+```
+
+# I apply the Box-Cox transformation with lambda=0.22:
+
+```{r}
+data_xts_bc <- boxcoxtransform(data_xts, lambda)
+
+med_bc <- tapply(data_xts_bc, rep(1:334, each = 144), mean)
+sds_bc <- tapply(data_xts_bc, rep(1:334, each = 144), sd)
+
+plot(med_bc, sds_bc) # 334 dots -> one for each day
+plot(med, sds) # 334 dots -> one for each day
+plot(data_xts_bc)
+
+a <- data.frame(cbind(med, sds))
+p <- ggplot(a, aes(x=med, y=sds)) + geom_point(size=0.8) + xlab('Mean') + ylab('Standard deviation')
+p
+ggsave('plots/scatter.jpg', p, height = 3 , width = 5)
+
+a <- data.frame(cbind(med_bc, sds_bc))
+p <- ggplot(a, aes(x=med_bc, y=sds_bc)) + geom_point(size=0.8) + xlab('Mean') + ylab('Standard deviation')
+p
+ggsave('plots/scatter_bc.jpg', p, height = 3 , width = 5)
+```
+
+# As we can see above, after the transformation there is no more dependency between mean and standard deviation.
+# I create the train and validation dataset with Box-Cox transformation:
+
+```{r}
+train_bc <- boxcoxtransform(train, lambda)
+full_train <- merge(train, train_bc)
+small_bc <- boxcoxtransform(small, lambda)
+full_small <- merge(small, small_bc)
+val_bc <- boxcoxtransform(val, lambda)
+full_val <- merge(val, val_bc)
+```
+
+```{r}
+# Save
+write.csv(as.data.frame(full_train), "train.csv")
+write.csv(as.data.frame(full_small), "small.csv")
+write.csv(as.data.frame(full_val), "val.csv")
+write.csv(as.data.frame(test), "test.csv")
+```
+
+
+
+
+
+
+

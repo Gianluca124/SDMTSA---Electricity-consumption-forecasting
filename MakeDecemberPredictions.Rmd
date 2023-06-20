@@ -1,0 +1,662 @@
+---
+title: "2.3_TRAIN&COMBINATION"
+output: html_document
+date: "2023-04-26"
+---
+
+# Import
+
+```{r, include=FALSE}
+# Set time zone
+Sys.setenv(TZ='GMT')
+
+# Import packages
+packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn", "MASS", 
+              "tidyr", "ggplot2", "lubridate", "randomForest", "ranger", 
+              "tibble", "tseries")
+
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+invisible(lapply(packages, library, character.only = TRUE))
+
+################################################################################
+
+lambda <- 0.2222222
+
+boxcoxtransform <- function(data, lambda) {
+  data_bc <- (data^lambda - 1) / lambda
+  return(data_bc)
+}
+
+boxcoxinverse <- function(data_bc, lambda) {
+  data <- (data_bc*lambda+1)^(1/lambda)
+  return(data)
+}
+```
+
+```{r}
+stats <- function(actual,pred){
+  rmse <- sqrt(mean((actual - pred)^2))
+  mape <- mean(abs((actual - pred)/actual))*100
+  mae <- mean(abs(actual - pred))
+  cat("RMSE", rmse, "\nMAPE", mape, "\nMAE ", mae, "\n")
+  return(c(rmse, mape, mae))
+}
+```
+
+```{r}
+plot_pred <- function(pred, days=3, color){
+  diff <- plot(data_xts[(val_index):(val_index+144*npred-1)]-pred, main = "Difference between real TS and prediction")
+  plot <- plot(data_xts[(val_index):(val_index+144*npred-1)], lwd=2, main = "Real TS vs. Pred.")
+  plot <- lines(pred, type = "l", col = color, lwd=2)
+  zoom <- plot(data_xts[(val_index+144*(npred-days)):(val_index+144*npred-1)], lwd=2, main = "3 days zoom")
+  zoom <- lines(pred, type = "l", col = color, lwd=2)
+  c(diff, plot, zoom)
+}
+```
+
+```{r}
+stats_results <- data.frame(matrix(nrow=0,ncol=4))
+colnames(stats_results)<-c("Model", "RMSE", "MAPE", "MAE")
+```
+
+```{r}
+# Data loading
+
+# Set working directory
+working_dir = dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(working_dir)
+
+data <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
+data_xts <- xts(data$y, as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT")) # Set date format
+
+train <- read.csv("train.csv", colClasses=c("character", "numeric", "numeric"))
+small <- read.csv("small.csv", colClasses=c("character", "numeric", "numeric"))
+val <- read.csv("val.csv", colClasses=c("character", "numeric", "numeric"))
+test <- read.csv("test.csv", colClasses=c("character", "numeric"))
+
+train <- xts(train[,-1], as.POSIXct(train$X, format="%Y-%m-%d %H:%M:%S", tz="GMT")) # Set date format
+small <- xts(small[,-1], as.POSIXct(small$X, format="%Y-%m-%d %H:%M:%S", tz="GMT")) # Set date format
+val <- xts(val[,-1], as.POSIXct(val$X, format="%Y-%m-%d %H:%M:%S", tz="GMT")) # Set date format
+test <- xts(test$V1, as.POSIXct(test$X, format="%Y-%m-%d %H:%M:%S", tz="GMT")) # Set date format
+```
+
+```{r}
+tseq <- seq(from = index(data_xts[nrow(data_xts),])+600, length.out = 144*30, by = 600)
+data_xts_complete <- c(data_xts, xts(rep(as.numeric(NA), length(tseq)), tseq))
+
+npred <- 30 # Number of days to forecast
+small_date <- "2017-09-01 00:00:00" # For a faster training I consider just September and October
+small_index <- which(index(data_xts_complete) == small_date)
+# I take november 2017 as the validation set
+val_date <- "2017-11-01 00:00:00"
+val_index <- which(index(data_xts_complete) == val_date)
+test_date <- "2017-12-01 00:00:00"
+test_index <- which(index(data_xts_complete) == test_date)
+cat(paste0("small_index: ", small_index,"\nval_index:   ", val_index, "\ntest_index:  ", test_index))
+```
+
+# SOME INFO: The dataset loaded before were just useful split on the original dataset. The train dataset contains
+##           observations from 2017/1/1 to 2017/10/31; the val dataset contains observations from 2017/11/1 to 
+##           2017/11/30 (this dataset was used for validation purposem in order to choose the best model); the
+##           small dataset is just a subset of the train dataset used to speed up the training process; the test
+##           dataset is just an empty xts to store the predictions. To use the previous inport functions make sure
+##           that those dataset are available in your current working directory.
+
+# DATASET VARIABLES: the train, small and val dataset contains two variables. The variable with the same name of the
+##                   dataset contains the original data, while the variable named 'datasetname_bc' contains the
+##                   values obtain via Box-Cox transformation. It is possible to make predictions on both variables.
+##                   In the following code the original values are used. 
+
+
+########################################################################################################################
+
+# FINAL TRAINING
+
+## In this markdown are proposed the best models for each of the 3 tested methods. First, the results on the 
+## validation set are shown. Then, the predictions on December are made.
+
+## The best models proposed are:
+### ARIMA:
+### 1) SARIMA(0,0,0)(1,0,0)[144] (w/ weekly sinusoids)
+### 2) SARIMA(0,1,1)(0,0,1)[7] (w/ hour average)
+
+### UCM:
+### 1) LLT + DAILY SEAS (w/ dummies) + WEEKLY SEAS (w/ 6 harmonics) - (w/ hour average)
+
+### MACHINE LEARNING:
+### 1) KNN, 1008 LAGS, MEDIAN
+
+# ARIMA
+
+## VALIDATION PERFORMANCE
+
+### 1) SARIMA(0,0,0)(1,0,0)[144] (w/ weekly sinusoids)
+
+```{r}
+# First, I biuld the sinusoids to model the weekly seasonality. Several tests were made to find the optimal number of
+# sinusoids. With no particular advantage in considering a greater number of sinusoids, 10 sinusoids were selected for
+# parsimony
+
+vj <- c(1,2,3,4,5,6,7,8,9,10)
+vt <- 1:(nrow(data_xts_complete))
+
+s_week <- 24*6*7 # base frequency for weekly seasonality (6 observation per hour, 24 hours per day, 7 days per week)
+
+freqt_weekly <- outer(vt,vj)*2*pi/s_week
+co_weekly <- cos(freqt_weekly)
+si_weekly <- sin(freqt_weekly)
+colnames(co_weekly) <- paste0("cosw",vj)
+colnames(si_weekly) <- paste0("sinw",vj)
+sinusoids_weekly <- cbind(co_weekly,
+                          si_weekly)
+```
+
+```{r}
+arima_w_sinusoids <- function(train, sinusoids) {
+  Arima(y = ts(train, freq = 144),
+        order = c(0, 0, 0),
+        seasonal = c(1, 0, 0),
+        include.constant = FALSE,
+        xreg = sinusoids,
+        method = 'CSS')}
+
+model_sinusoids <- arima_w_sinusoids(train$train, # I work on the original values
+                                     sinusoids_weekly[1:(val_index-1),])
+summary(model_sinusoids)
+```
+
+```{r}
+model_sinusoids_predictions <- forecast(model_sinusoids, 144*npred,
+                                        xreg=sinusoids_weekly[val_index:(test_index-1),])
+model_sinusoids_predictions <- xts(model_sinusoids_predictions$mean, index(val))
+```
+
+```{r}
+plot_pred(model_sinusoids_predictions, color = "red")
+stats_results[nrow(stats_results) + 1,] <- c("SARIMA(0,0,0)(1,0,0)[144] (w/ weekly sinusoids)", 
+                                             stats(val$val, model_sinusoids_predictions))
+```
+
+### 2) SARIMA(0,1,1)(0,0,1)[7] (w/ hour average)
+
+```{r}
+# Perform hour aggregation on the train set 
+train_meanhour <- period.apply(train$train, endpoints(train$train, "hours"), mean)
+index(train_meanhour) <- index(train_meanhour)-600*2
+
+train_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  train_byhour[[hour]] <- train_meanhour[seq(hour, length(train_meanhour), 24)]
+}
+
+# Perform hour aggregation on the val set
+val_meanhour <- period.apply(val$val, endpoints(val$val, "hours"), mean)
+index(val_meanhour) <- index(val_meanhour)-600*2
+
+val_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  val_byhour[[hour]] <- val_meanhour[seq(hour, length(val_meanhour), 24)]
+  }
+```
+
+```{r}
+arima_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  arima_byhour[[hour]] <- Arima(y = ts(train_byhour[[hour]], freq = 7),
+                                order = c(0, 1, 1),
+                                seasonal = c(0, 0, 1),
+                                include.constant = FALSE)
+  }
+```
+
+```{r}
+arima_byhour_predictions <- vector('list', 24)
+for (hour in 1:24) {
+  arima_byhour_predictions[[hour]] <- forecast(arima_byhour[[hour]], npred)
+  arima_byhour_predictions[[hour]] <- xts(arima_byhour_predictions[[hour]]$mean, index(val_byhour[[hour]]))
+}
+
+# Concatenate the predictions
+arima_byhour_predictions_merged <- do.call(rbind, arima_byhour_predictions) 
+```
+
+```{r}
+# I need to restore the original time frequency. I do that via spline approximation:
+temp <- xts(rep(as.numeric(NA), length(val$val)), index(val$val))
+model_hour_predictions <- merge(temp, arima_byhour_predictions_merged)$arima_byhour_predictions_merged
+model_hour_predictions <- na.spline(model_hour_predictions, na.rm = FALSE)
+model_hour_predictions <- na.locf(model_hour_predictions, na.rm = FALSE)
+model_hour_predictions <- na.locf(model_hour_predictions, fromLast = TRUE)
+names(model_hour_predictions) <- "V1"
+```
+
+```{r}
+plot_pred(model_hour_predictions, color = "red")
+stats_results[nrow(stats_results) + 1,] <- c("SARIMA(0,1,1)(0,0,1)[7] (w/ hour average)", 
+                                             stats(val$val, model_hour_predictions))
+```
+
+```{r}
+arima_stats_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  arima_stats_byhour[[hour]] <- stats(arima_byhour_predictions[[hour]], val_byhour[[hour]])[[3]]
+}
+plot(unlist(arima_stats_byhour), type='l', ylab = 'MAE', xlab = 'Hour')
+
+
+p <- ggplot(data = data.frame(x=1:24, y=unlist(arima_stats_byhour)), aes(x=x, y=y)) +
+  geom_point() + 
+  geom_segment( aes(x=x, xend=x, y=0, yend=y)) + xlab('Hours') + ylab('MAE')
+p
+```
+
+### FORECAST COMBINATION
+
+#### Inspired by ensemble forecast techniques, which combine predictions produced by different models to obtain a more
+#### consistent estimate of the target variable, we investigate whether the predictions produced by the two methods can
+#### be combined to obtain a better MAE value on the validation set. The goal is to leverage the strengths of the first
+#### model, trained on the entire historical series, and the second model, trained on the hourly average.
+
+```{r}
+forecast_combination <- function(w) mean(abs(val$val - (w*model_sinusoids_predictions+(1-w)*model_hour_predictions)))
+```
+
+```{r}
+my_optim <- optimize(forecast_combination, c(0,1))
+my_optim
+```
+
+```{r}
+combined_predictions <- my_optim$minimum*model_sinusoids_predictions+(1-my_optim$minimum)*model_hour_predictions
+
+plot_pred(combined_predictions, color = "red")
+stats_results[nrow(stats_results) + 1,] <- c("ARIMA - Forecast combination", stats(val$val, combined_predictions))
+```
+
+## DECEMBER PREDICTIONS
+
+```{r}
+training_complete <- rbind(train, val)
+```
+
+```{r}
+model_sinusoids_final <- arima_w_sinusoids(training_complete$train, # I work on the original values
+                                           sinusoids_weekly[1:(test_index-1),])
+summary(model_sinusoids_final)
+```
+
+```{r}
+december_predictions_sinusoids <- forecast(model_sinusoids_final, 144*npred,
+                                           xreg=sinusoids_weekly[test_index:nrow(sinusoids_weekly),])
+december_predictions_sinusoids <- xts(december_predictions_sinusoids$mean, index(test))
+```
+
+#########################################################################################################################
+
+```{r}
+# Perform hour aggregation on the train set 
+train_meanhour <- period.apply(training_complete$train, endpoints(training_complete$train, "hours"), mean)
+index(train_meanhour) <- index(train_meanhour)-600*2
+
+train_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  train_byhour[[hour]] <- train_meanhour[seq(hour, length(train_meanhour), 24)]
+}
+
+# Perform hour aggregation on the test set
+test_meanhour <- period.apply(test, endpoints(test, "hours"), mean)
+index(test_meanhour) <- index(test_meanhour)-600*2
+
+test_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  test_byhour[[hour]] <- test_meanhour[seq(hour, length(test_meanhour), 24)]
+  }
+```
+
+```{r}
+arima_byhour_final <- vector('list', 24)
+for (hour in 1:24) {
+  arima_byhour_final[[hour]] <- Arima(y = ts(train_byhour[[hour]], freq = 7),
+                                      order = c(0, 1, 1),
+                                      seasonal = c(0, 0, 1),
+                                      include.constant = FALSE)
+  }
+```
+
+```{r}
+december_byhour_predictions <- vector('list', 24)
+for (hour in 1:24) {
+  december_byhour_predictions[[hour]] <- forecast(arima_byhour_final[[hour]], npred)
+  december_byhour_predictions[[hour]] <- xts(december_byhour_predictions[[hour]]$mean, index(test_byhour[[hour]]))
+}
+
+# Concatenate the predictions
+december_byhour_predictions_merged <- do.call(rbind, december_byhour_predictions) 
+```
+
+```{r}
+# I need to restore the original time frequency. I do that via spline approximation:
+temp <- xts(rep(as.numeric(NA), nrow(test)), index(test))
+december_hour_predictions <- merge(temp, december_byhour_predictions_merged)$december_byhour_predictions_merged
+december_hour_predictions <- na.spline(december_hour_predictions, na.rm = FALSE)
+december_hour_predictions <- na.locf(december_hour_predictions, na.rm = FALSE)
+december_hour_predictions <- na.locf(december_hour_predictions, fromLast = TRUE)
+names(december_hour_predictions) <- "V1"
+```
+
+#########################################################################################################################
+
+```{r}
+december_arima <- my_optim$minimum*december_predictions_sinusoids+(1-my_optim$minimum)*december_hour_predictions
+colnames(december_arima) <- c('ARIMA')
+```
+
+```{r}
+plot_arima_pred <- merge.xts(Actual = data_xts['2017-11-01/'], ARIMA = december_arima)
+plot_arima_pred <- data.frame(plot_arima_pred, date=index(plot_arima_pred))
+plot_arima_pred <- gather(plot_arima_pred, Model, Values, Actual:ARIMA)
+
+p <- ggplot(data = plot_arima_pred, aes(x=date, y=Values)) +
+  geom_line(aes(color = Model), size = 0.5) +
+  labs(y = "Power", x = '') + 
+  scale_color_manual(values=c("black", "red"))
+p
+```
+
+# UCM 
+
+## VALIDATION PERFORMANCE
+
+```{r}
+dt <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
+```
+
+```{r}
+# Transforming into datetime object
+dt$X <- as.POSIXct(dt$X, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+# Extract the hour information from the datetime column
+dt$hour <- format(dt$X, "%H")
+
+# Aggregate the data by hour and calculate the mean
+agg_dt <- aggregate(dt$y, list(hour=cut(as.POSIXct(dt$X), "hour")), mean)
+
+# Rename the columns for better readability
+colnames(agg_dt) <- c("date", "mean")
+
+# Convert into xts
+xts_dt <- xts(agg_dt[, 2], order.by = as.POSIXct(agg_dt$date, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+colnames(xts_dt) <- c("y")
+```
+
+```{r}
+y <- xts_dt$y
+y0 <- y
+y0[7297:8016] <- NA
+```
+
+```{r}
+mod_validation <- SSModel(as.numeric(y0) ~ 
+                            SSMtrend(2, list(NA, NA)) + 
+                            SSMseasonal(24, NA, "dummy") +
+                            SSMseasonal(168, NA, "trigonometric", harmonics = 1:6),
+                          H = NA)
+```
+
+```{r}
+vy <- var(as.numeric(y0), na.rm = TRUE)
+
+mod_validation$P1inf[] <- 0
+diag(mod_validation$P1) <- vy * 10
+mod_validation$a1[1] <- mean(y0[1:672])
+
+pars <- c(
+  logVarEta = log(vy / 100), 
+  logVarZeta  = log(vy / 10000),
+  logVarOm168 = log(vy / 10000),
+  logVarOm24 = log(vy / 1000),
+  logVarEps   = log(vy / 100) 
+)
+
+updtfn <- function(pars, model) {
+  nq <- nrow(model$Q[, , 1])
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[4])
+  model$H[1, 1, 1] <- exp(pars[5])
+  diag(model$Q[4:nq, 4:nq, 1]) <- exp(pars[3])
+  model
+}
+```
+
+```{r}
+fit_validation <- fitSSM(mod_validation, pars, updtfn, control = list(maxit = 2000))
+fit_validation$optim.out
+```
+
+```{r}
+kfs_validation <- KFS(fit_validation$model, smoothing = c("state", "signal", "disturbance")) 
+```
+
+```{r}
+# Takes the average predictions per hour
+avg_prediction <- kfs_validation$muhat[7297:8016]
+# Set the datetime with 1-hour time step
+val_start_date <- as.POSIXct("2017-11-01 00:00:00", tz = "UTC")
+val_end_date <- as.POSIXct("2017-11-30 23:00:00", tz = "UTC")
+val_date_sequence <- seq(from = val_start_date, to = val_end_date, by = "1 hour")
+# Convert into xts object
+avg_prediction <- xts(avg_prediction, val_date_sequence)
+
+# Made the approximation to return to 10-minutes time step
+val_full_start_date <- as.POSIXct("2017-11-01 00:00:00", tz = "UTC")
+val_full_end_date <- as.POSIXct("2017-11-30 23:50:00", tz = "UTC")
+val_full_date_sequence <- seq(from = val_full_start_date, to = val_full_end_date, by = "10 min")
+temp <- xts(rep(as.numeric(NA), 4320), val_full_date_sequence)
+ucm_validation_predictions <- merge(temp, avg_prediction)$avg_prediction
+ucm_validation_predictions <- na.approx(ucm_validation_predictions, na.rm = FALSE)
+ucm_validation_predictions <- na.locf(ucm_validation_predictions, na.rm = FALSE)
+ucm_validation_predictions <- na.locf(ucm_validation_predictions, fromLast = TRUE)
+names(ucm_validation_predictions) <- "V1"
+```
+
+```{r}
+plot_pred(ucm_validation_predictions, color = "blue")
+stats_results[nrow(stats_results) + 1,] <- c("UCM", stats(val$val, ucm_validation_predictions))
+```
+
+## DECEMBER PREDICTIONS
+
+```{r}
+# I work on different objects to avoid conflicts
+dt <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
+test <- read.csv("test.csv", colClasses=c("character", "numeric"))
+colnames(test) <- colnames(dt)
+dt <- rbind(dt, test)
+
+dt$X <- as.POSIXct(dt$X, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+dt$hour <- format(dt$X, "%H")
+```
+
+```{r}
+# Aggregate the data by hour and calculate the mean
+agg_dt <- aggregate(dt$y, list(hour=cut(as.POSIXct(dt$X), "hour")), mean)
+
+colnames(agg_dt) <- c("date", "mean")
+
+# Convert into xts
+xts_dt <- xts(agg_dt[, 2], order.by = as.POSIXct(agg_dt$date, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+colnames(xts_dt) <- c("y")
+```
+
+```{r}
+# Extract target value for better readability of the code below
+y <- xts_dt$y
+```
+
+```{r}
+ucm_model <- SSModel(as.numeric(y) ~ 
+                       SSMtrend(2, list(NA, NA)) + 
+                       SSMseasonal(24, NA, "dummy") +
+                       SSMseasonal(168, NA, "trigonometric", harmonics = 1:6), # No improvements with higher values
+                     H = NA)
+```
+
+```{r}
+vy <- var(as.numeric(y), na.rm = TRUE)
+
+ucm_model$P1inf[] <- 0
+diag(ucm_model$P1) <- vy * 10
+ucm_model$a1[1] <- mean(y[1:672]) # I use as initial value the mean of the first month
+
+pars <- c(
+  logVarEta = log(vy / 100), 
+  logVarZeta  = log(vy / 10000),
+  logVarOm168 = log(vy / 10000),
+  logVarOm24 = log(vy / 1000),
+  logVarEps   = log(vy / 100) 
+)
+
+updtfn <- function(pars, model) {
+  nq <- nrow(model$Q[, , 1])
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[4])
+  model$H[1, 1, 1] <- exp(pars[5])
+  diag(model$Q[4:nq, 4:nq, 1]) <- exp(pars[3])
+  model
+}
+```
+
+```{r}
+fit <- fitSSM(ucm_model, pars, updtfn, control = list(maxit = 2000))
+fit$optim.out
+```
+
+```{r}
+kfs <- KFS(fit$model, smoothing = c("state", "signal", "disturbance")) 
+```
+
+```{r}
+# Takes the average predictions per hour
+december_avg_prediction <- kfs$muhat[8017:8736]
+# Set the datetime with 1-hour time step
+test_start_date <- as.POSIXct("2017-12-01 00:00:00", tz = "UTC")
+test_end_date <- as.POSIXct("2017-12-30 23:00:00", tz = "UTC")
+test_date_sequence <- seq(from = test_start_date, to = test_end_date, by = "1 hour")
+# Convert into xts object
+december_avg_prediction <- xts(december_avg_prediction, test_date_sequence)
+
+# Made the approximation to return to 10-minutes time step
+test_full_start_date <- as.POSIXct("2017-12-01 00:00:00", tz = "UTC")
+test_full_end_date <- as.POSIXct("2017-12-30 23:50:00", tz = "UTC")
+test_full_date_sequence <- seq(from = test_full_start_date, to = test_full_end_date, by = "10 min")
+temp <- xts(rep(as.numeric(NA), 4320), test_full_date_sequence)
+december_ucm <- merge(temp, december_avg_prediction)$december_avg_prediction
+december_ucm <- na.spline(december_ucm, na.rm = FALSE)
+december_ucm <- na.locf(december_ucm, na.rm = FALSE)
+december_ucm <- na.locf(december_ucm, fromLast = TRUE)
+colnames(december_ucm) <- c("UCM")
+```
+
+```{r}
+plot_ucm_pred <- merge.xts(Actual = data_xts['2017-11-01/'], UCM = december_ucm)
+plot_ucm_pred <- data.frame(plot_ucm_pred, date=index(plot_ucm_pred))
+plot_ucm_pred <- gather(plot_ucm_pred, Model, Values, Actual:UCM)
+
+p <- ggplot(data = plot_ucm_pred, aes(x=date, y=Values)) +
+  geom_line(aes(color = Model), size = 0.5) +
+  labs(y = "Power", x = '') + 
+  scale_color_manual(values=c("black", "blue"))
+p
+```
+
+# MACHINE LEARNING
+
+## VALIDATION PERFORMANCE
+
+```{r}
+knn_train <- function(train){
+  knn_forecasting(ts(train),
+                  h = 144*npred,
+                  lags = 1:(144*7),
+                  k=6,
+                  msas = "MIMO",
+                  cf = "median",
+                  transform = "multiplicative")}
+```
+
+```{r}
+knn_validation <- knn_train(train$train)
+knn_validation_predictions <- xts(knn_validation$prediction, index(val))
+```
+
+```{r}
+plot_pred(knn_validation_predictions, color = "green")
+
+stats_results[nrow(stats_results) + 1,] <- c("KNN", stats(val$val, knn_validation_predictions))
+```
+
+## DECEMBER PREDICTION
+
+```{r}
+knn_final <- knn_train(training_complete$train)
+december_ml <- xts(knn_final$prediction, index(december_ucm))
+```
+
+#########################################################################################################################
+
+```{r}
+colnames(december_ml) <- c('ML')
+```
+
+```{r}
+plot_ml_pred <- merge.xts(Actual = data_xts['2017-11-01/'], ML = december_ml)
+plot_ml_pred <- data.frame(plot_ml_pred, date=index(plot_ml_pred))
+plot_ml_pred <- gather(plot_ml_pred, Model, Values, Actual:ML)
+
+p <- ggplot(data = plot_ml_pred, aes(x=date, y=Values)) +
+  geom_line(aes(color = Model), size = 0.5) +
+  labs(y = "Power", x = '') + 
+  scale_color_manual(values=c("black", "green"))
+p
+```
+
+#########################################################################################################################
+
+```{r}
+# Saving validation performances
+write.csv(stats_results, "best_models_validation.csv")
+```
+
+```{r}
+predictions <- cbind(december_arima, december_ucm, december_ml)
+```
+
+```{r}
+plot_pred <- merge.xts(Actual = data_xts['2017-11-01/'], ARIMA = december_arima)
+plot_pred <- merge.xts(plot_pred, UCM = december_ucm)
+plot_pred <- merge.xts(plot_pred, ML = december_ml)
+plot_pred <- data.frame(plot_pred, date=index(plot_pred))
+plot_pred <- gather(plot_pred, Model, Values, Actual:ML)
+
+p <- ggplot(data = plot_pred, aes(x=date, y=Values)) +
+  geom_line(aes(color = Model), size = 0.5) +
+  labs(y = "Power", x = '') + 
+  scale_color_manual(values=c("black", "#F8766D", "#00BA38", "#619CFF"))
+p
+```
+
+```{r}
+# Saving validation performances
+results <- data.frame(date = index(predictions),
+                      ARIMA = december_arima,
+                      UCM = december_ucm,
+                      ML = december_ml)
+write.csv(results, "826049_20230105.csv")
+```
